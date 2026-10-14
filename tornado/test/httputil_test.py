@@ -491,6 +491,9 @@ Foo: even
             sorted(list(headers.get_all())),
             [("Asdf", "qwer zxcv"), ("Foo", "bar baz"), ("Foo", "even more lines")],
         )
+        # Verify case insensitivity in-operator
+        self.assertTrue("asdf" in headers)
+        self.assertTrue("Asdf" in headers)
 
     def test_malformed_continuation(self):
         # If the first line starts with whitespace, it's a
@@ -613,6 +616,95 @@ Foo: even
         headers.add("Foo", "3")
         headers2 = HTTPHeaders.parse(str(headers))
         self.assertEqual(headers, headers2)
+
+    def test_linear_performance(self):
+        def f(n):
+            start = time.perf_counter()
+            headers = HTTPHeaders()
+            for i in range(n):
+                headers.add("X-Foo", "bar")
+            return time.perf_counter() - start
+
+        # This runs under 50ms on my laptop as of 2025-12-09.
+        # Take the best of several runs to reduce noise on shared CI machines.
+        d1 = min(f(10_000) for _ in range(3))
+        d2 = min(f(100_000) for _ in range(3))
+        if d2 / d1 > 20:
+            # d2 should be about 10x d1 but allow a wide margin for variability.
+            self.fail(f"HTTPHeaders.add() does not scale linearly: {d1=} vs {d2=}")
+
+    def test_parse_repeated_header_linear_performance(self):
+        # The same issue as test_linear_performance, but exercised through
+        # HTTPHeaders.parse as used for request headers and multipart part
+        # headers: a single block of headers repeating one field name many
+        # times must not take quadratic time to parse.
+        def f(n):
+            data = "X-Foo: bar\r\n" * n
+            start = time.perf_counter()
+            headers = HTTPHeaders.parse(data)
+            elapsed = time.perf_counter() - start
+            self.assertEqual(len(headers.get_list("X-Foo")), n)
+            return elapsed
+
+        d1 = min(f(10_000) for _ in range(3))
+        d2 = min(f(100_000) for _ in range(3))
+        if d2 / d1 > 20:
+            # d2 should be about 10x d1 but allow a wide margin for variability.
+            self.fail(f"HTTPHeaders.parse() does not scale linearly: {d1=} vs {d2=}")
+
+    def test_combined_value_cache(self):
+        # The combined (comma-joined) value is computed lazily and cached;
+        # make sure every mutation is reflected in subsequent lookups.
+        headers = HTTPHeaders()
+        headers.add("Foo", "a")
+        self.assertEqual(headers["foo"], "a")
+        headers.add("foo", "b")
+        self.assertEqual(headers["Foo"], "a,b")
+        headers.add("FOO", "c")
+        self.assertEqual(headers["foo"], "a,b,c")
+        self.assertEqual(headers.get_list("foo"), ["a", "b", "c"])
+        self.assertEqual(len(headers), 1)
+        self.assertEqual(list(headers), ["Foo"])
+        self.assertEqual(dict(headers.items()), {"Foo": "a,b,c"})
+
+        # Deleting a header whose cached combined value was just invalidated.
+        headers.add("Foo", "d")
+        del headers["foo"]
+        self.assertFalse("Foo" in headers)
+        self.assertEqual(len(headers), 0)
+        self.assertEqual(headers.get_list("foo"), [])
+        self.assertIsNone(headers.get("foo"))
+        with self.assertRaises(KeyError):
+            headers["foo"]
+        with self.assertRaises(KeyError):
+            del headers["foo"]
+
+        # __setitem__ replaces every previous value.
+        headers.add("Bar", "1")
+        headers.add("Bar", "2")
+        self.assertEqual(headers["bar"], "1,2")
+        headers["bar"] = "3"
+        self.assertEqual(headers["bar"], "3")
+        self.assertEqual(headers.get_list("bar"), ["3"])
+
+        # Continuation lines update the combined value.
+        headers = HTTPHeaders()
+        headers.parse_line("Foo: a")
+        headers.parse_line("Foo: b")
+        self.assertEqual(headers["foo"], "a,b")
+        headers.parse_line("  c")
+        self.assertEqual(headers["foo"], "a,b c")
+        self.assertEqual(headers.get_list("foo"), ["a", "b c"])
+
+        # Membership is case-insensitive and rejects non-string keys.
+        self.assertTrue("foo" in headers)
+        self.assertTrue("FOO" in headers)
+        self.assertFalse("bar" in headers)
+        self.assertFalse(1 in headers)
+
+        # Copies carry the same combined values.
+        self.assertEqual(headers.copy()["foo"], "a,b c")
+        self.assertEqual(copy.deepcopy(headers)["foo"], "a,b c")
 
 
 class FormatTimestampTest(unittest.TestCase):
