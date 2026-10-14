@@ -16,7 +16,6 @@ from tornado.httputil import (
 )
 from tornado.escape import utf8, native_str
 from tornado.log import gen_log
-from tornado.testing import ExpectLog
 from tornado.test.util import ignore_deprecation
 
 import copy
@@ -26,6 +25,7 @@ import pickle
 import time
 import urllib.parse
 import unittest
+from unittest import mock
 
 from typing import Tuple, Dict, List
 
@@ -199,7 +199,9 @@ Foo
             b"\n", b"\r\n"
         )
         args, files = form_data_args()
-        with ExpectLog(gen_log, "multipart/form-data missing headers"):
+        with self.assertRaises(
+            HTTPInputError, msg="multipart/form-data missing headers"
+        ):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
 
@@ -213,7 +215,7 @@ Foo
             b"\n", b"\r\n"
         )
         args, files = form_data_args()
-        with ExpectLog(gen_log, "Invalid multipart/form-data"):
+        with self.assertRaises(HTTPInputError, msg="Invalid multipart/form-data"):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
 
@@ -226,7 +228,7 @@ Foo--1234--""".replace(
             b"\n", b"\r\n"
         )
         args, files = form_data_args()
-        with ExpectLog(gen_log, "Invalid multipart/form-data"):
+        with self.assertRaises(HTTPInputError, msg="Invalid multipart/form-data"):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
 
@@ -240,7 +242,9 @@ Foo
             b"\n", b"\r\n"
         )
         args, files = form_data_args()
-        with ExpectLog(gen_log, "multipart/form-data value missing name"):
+        with self.assertRaises(
+            HTTPInputError, msg="multipart/form-data value missing name"
+        ):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
 
@@ -327,14 +331,15 @@ Content-Disposition: form-data; name="files"; filename="ab.txt"
 
     def test_body_arguments_too_many_parts(self):
         # The server-side entry point (HTTPServerRequest._parse_body) goes
-        # through parse_body_arguments, which logs and discards the body.
+        # through parse_body_arguments, which raises HTTPInputError.
         part = b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nb\r\n'
         body = part * 1000 + b"--1234--"
         args, files = form_data_args()
-        with ExpectLog(gen_log, ".*too many parts"):
+        with self.assertRaises(HTTPInputError) as cm:
             parse_body_arguments(
                 "multipart/form-data; boundary=1234", body, args, files
             )
+        self.assertIn("too many parts", str(cm.exception))
         self.assertEqual(args, {})
         self.assertEqual(files, {})
 
@@ -343,20 +348,22 @@ Content-Disposition: form-data; name="files"; filename="ab.txt"
         header += b"x" * (64 * 1024)
         body = b"--1234\r\n" + header + b"\r\n\r\nb\r\n--1234--"
         args, files = form_data_args()
-        with ExpectLog(gen_log, ".*header too large"):
+        with self.assertRaises(HTTPInputError) as cm:
             parse_body_arguments(
                 "multipart/form-data; boundary=1234", body, args, files
             )
+        self.assertIn("header too large", str(cm.exception))
         self.assertEqual(args, {})
 
     def test_body_arguments_invalid_content_type(self):
         part = b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nb\r\n'
         body = part + b"--1234--"
         args, files = form_data_args()
-        with ExpectLog(gen_log, ".*Invalid content type"):
+        with self.assertRaises(HTTPInputError) as cm:
             parse_body_arguments(
                 "multipart/form-dataxyz; boundary=1234", body, args, files
             )
+        self.assertIn("Invalid content type", str(cm.exception))
         self.assertEqual(args, {})
 
     def test_body_arguments_config(self):
@@ -367,8 +374,9 @@ Content-Disposition: form-data; name="files"; filename="ab.txt"
         # An explicit config raises or lowers the limits.
         args, files = form_data_args()
         config = ParseBodyConfig(multipart=ParseMultipartConfig(max_parts=2))
-        with ExpectLog(gen_log, ".*too many parts"):
+        with self.assertRaises(HTTPInputError) as cm:
             parse_body_arguments(content_type, body, args, files, config=config)
+        self.assertIn("too many parts", str(cm.exception))
         self.assertEqual(args, {})
 
         # The global default config can disable multipart parsing entirely.
@@ -377,8 +385,9 @@ Content-Disposition: form-data; name="files"; filename="ab.txt"
         )
         try:
             args, files = form_data_args()
-            with ExpectLog(gen_log, ".*multipart/form-data parsing is disabled"):
+            with self.assertRaises(HTTPInputError) as cm:
                 parse_body_arguments(content_type, body, args, files)
+            self.assertIn("multipart/form-data parsing is disabled", str(cm.exception))
             self.assertEqual(args, {})
         finally:
             set_parse_body_config(ParseBodyConfig())
@@ -387,6 +396,73 @@ Content-Disposition: form-data; name="files"; filename="ab.txt"
         args, files = form_data_args()
         parse_body_arguments(content_type, body, args, files)
         self.assertEqual(args["a"], [b"b", b"b", b"b"])
+
+    def test_malformed_parts_raise_without_logging(self):
+        # CVE-2025-47287: malformed parts used to be logged one at a time
+        # while the parser kept going, so a single request could produce a
+        # large volume of (synchronous) log output. Parsing must now stop at
+        # the first malformed part with an HTTPInputError and log nothing.
+        good_part = b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nb\r\n'
+        bad_parts = {
+            "missing headers": b"--1234\r\nFoo\r\n",
+            "invalid disposition": (
+                b'--1234\r\nContent-Disposition: invalid; name="a"\r\n\r\nFoo\r\n'
+            ),
+            "no trailing line break": (
+                b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nFoo'
+            ),
+            "missing name": b"--1234\r\nContent-Disposition: form-data\r\n\r\nFoo\r\n",
+        }
+        for label, bad_part in bad_parts.items():
+            body = bad_part * 50 + good_part + b"--1234--"
+            with mock.patch.object(gen_log, "warning") as warning:
+                args, files = form_data_args()
+                with self.assertRaises(HTTPInputError, msg=label):
+                    parse_multipart_form_data(b"1234", body, args, files)
+                self.assertEqual(args, {}, label)
+                self.assertEqual(files, {}, label)
+
+                args, files = form_data_args()
+                with self.assertRaises(HTTPInputError, msg=label) as cm:
+                    parse_body_arguments(
+                        "multipart/form-data; boundary=1234", body, args, files
+                    )
+                self.assertIn("Invalid multipart/form-data", str(cm.exception))
+                self.assertEqual(args, {}, label)
+                self.assertEqual(files, {}, label)
+            self.assertEqual(warning.call_count, 0, label)
+
+    def test_body_errors_raise_without_logging(self):
+        # The remaining body-level errors are also raised instead of logged.
+        part = b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nb\r\n'
+        cases = [
+            # No final boundary.
+            ("multipart/form-data; boundary=1234", part, None),
+            # No boundary in the content type.
+            ("multipart/form-data", part + b"--1234--", None),
+            # Content-Encoding is not supported for form bodies.
+            (
+                "multipart/form-data; boundary=1234",
+                part + b"--1234--",
+                HTTPHeaders({"Content-Encoding": "gzip"}),
+            ),
+            (
+                "application/x-www-form-urlencoded",
+                b"a=b",
+                HTTPHeaders({"Content-Encoding": "gzip"}),
+            ),
+        ]
+        with mock.patch.object(gen_log, "warning") as warning:
+            for content_type, body, headers in cases:
+                args, files = form_data_args()
+                with self.assertRaises(HTTPInputError, msg=content_type):
+                    parse_body_arguments(content_type, body, args, files, headers)
+                self.assertEqual(args, {})
+                self.assertEqual(files, {})
+            with self.assertRaises(HTTPInputError) as cm:
+                parse_multipart_form_data(b"1234", part, {}, {})
+            self.assertIn("no final boundary", str(cm.exception))
+        self.assertEqual(warning.call_count, 0)
 
 
 class HTTPHeadersTest(unittest.TestCase):

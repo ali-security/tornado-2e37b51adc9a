@@ -57,6 +57,7 @@ import re
 import socket
 import typing  # noqa: F401
 import unittest
+from unittest import mock
 import urllib.parse
 
 
@@ -2351,6 +2352,78 @@ class HandlerByNameTest(WebTestCase):
         self.assertEqual(resp.body, b"hello")
         resp = self.fetch("/hello3")
         self.assertEqual(resp.body, b"hello")
+
+
+class InvalidBodyTest(WebTestCase):
+    def get_handlers(self):
+        class EchoArgsHandler(RequestHandler):
+            def post(self):
+                self.write(
+                    dict(
+                        arguments=recursive_unicode(self.request.body_arguments),
+                        files=sorted(self.request.files.keys()),
+                    )
+                )
+
+        return [("/echo", EchoArgsHandler)]
+
+    def post_multipart(self, body):
+        return self.fetch(
+            "/echo",
+            method="POST",
+            body=body,
+            headers={"Content-Type": "multipart/form-data; boundary=1234"},
+        )
+
+    def test_valid_multipart(self):
+        part = b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nb\r\n'
+        response = self.post_multipart(part + b"--1234--")
+        self.assertEqual(response.code, 200)
+        self.assertEqual(
+            json_decode(response.body), dict(arguments={"a": ["b"]}, files=[])
+        )
+
+    def test_malformed_multipart_parts(self):
+        # CVE-2025-47287: a body made of many malformed parts used to log a
+        # warning for every part (while the request still succeeded). It must
+        # now be rejected with a single 400 response and a single log line.
+        good_part = b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nb\r\n'
+        bad_parts = [
+            b"--1234\r\nFoo\r\n",
+            b'--1234\r\nContent-Disposition: invalid; name="a"\r\n\r\nFoo\r\n',
+            b"--1234\r\nContent-Disposition: form-data\r\n\r\nFoo\r\n",
+        ]
+        for bad_part in bad_parts:
+            body = bad_part * 50 + good_part + b"--1234--"
+            with mock.patch.object(gen_log, "warning") as warning:
+                response = self.post_multipart(body)
+            self.assertEqual(response.code, 400)
+            self.assertEqual(warning.call_count, 1)
+            log_args = warning.call_args[0]
+            message = log_args[0] % tuple(log_args[1:])
+            self.assertIn("400 POST /echo", message)
+            self.assertIn("Invalid body: Invalid multipart/form-data", message)
+
+    def test_missing_final_boundary(self):
+        part = b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nb\r\n'
+        with ExpectLog(gen_log, ".*Invalid body.*no final boundary"):
+            response = self.post_multipart(part)
+        self.assertEqual(response.code, 400)
+
+    def test_percent_in_error_message(self):
+        # The error message includes attacker-controlled data; make sure it
+        # is not interpreted as a format string when logged.
+        with ExpectLog(gen_log, ".*Unsupported Content-Encoding: %s%d"):
+            response = self.fetch(
+                "/echo",
+                method="POST",
+                body=b"a=b",
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Content-Encoding": "%s%d",
+                },
+            )
+        self.assertEqual(response.code, 400)
 
 
 class StreamingRequestBodyTest(WebTestCase):
