@@ -1,5 +1,6 @@
 from tornado.httputil import (
     url_concat,
+    parse_body_arguments,
     parse_multipart_form_data,
     HTTPHeaders,
     format_timestamp,
@@ -9,6 +10,9 @@ from tornado.httputil import (
     qs_to_qsl,
     HTTPInputError,
     HTTPFile,
+    ParseBodyConfig,
+    ParseMultipartConfig,
+    set_parse_body_config,
 )
 from tornado.escape import utf8, native_str
 from tornado.log import gen_log
@@ -258,6 +262,131 @@ Foo
         file = files["files"][0]
         self.assertEqual(file["filename"], "ab.txt")
         self.assertEqual(file["body"], b"Foo")
+
+    def test_multipart_config(self):
+        boundary = b"1234"
+        body = b"""--1234
+Content-Disposition: form-data; name="files"; filename="ab.txt"
+
+--1234--""".replace(
+            b"\n", b"\r\n"
+        )
+        config = ParseMultipartConfig()
+        args, files = form_data_args()
+        parse_multipart_form_data(boundary, body, args, files, config=config)
+        self.assertEqual(files["files"][0]["filename"], "ab.txt")
+
+        config_no_parts = ParseMultipartConfig(max_parts=0)
+        with self.assertRaises(HTTPInputError) as cm:
+            parse_multipart_form_data(
+                boundary, body, args, files, config=config_no_parts
+            )
+        self.assertIn("too many parts", str(cm.exception))
+
+        config_small_headers = ParseMultipartConfig(max_part_header_size=10)
+        with self.assertRaises(HTTPInputError) as cm:
+            parse_multipart_form_data(
+                boundary, body, args, files, config=config_small_headers
+            )
+        self.assertIn("header too large", str(cm.exception))
+
+        config_disabled = ParseMultipartConfig(enabled=False)
+        with self.assertRaises(HTTPInputError) as cm:
+            parse_multipart_form_data(
+                boundary, body, args, files, config=config_disabled
+            )
+        self.assertIn("multipart/form-data parsing is disabled", str(cm.exception))
+
+    def test_default_max_parts(self):
+        # A body with more parts than the default limit (100) is rejected
+        # before any of the parts are parsed.
+        part = b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nb\r\n'
+        body = part * 101 + b"--1234--"
+        args, files = form_data_args()
+        with self.assertRaises(HTTPInputError) as cm:
+            parse_multipart_form_data(b"1234", body, args, files)
+        self.assertIn("too many parts", str(cm.exception))
+        self.assertEqual(args, {})
+        self.assertEqual(files, {})
+
+        # A body within the limit is still parsed.
+        body = part * 99 + b"--1234--"
+        args, files = form_data_args()
+        parse_multipart_form_data(b"1234", body, args, files)
+        self.assertEqual(len(args["a"]), 99)
+
+    def test_default_max_part_header_size(self):
+        header = b'Content-Disposition: form-data; name="a"\r\nX-Pad: '
+        header += b"x" * (10 * 1024)
+        body = b"--1234\r\n" + header + b"\r\n\r\nb\r\n--1234--"
+        args, files = form_data_args()
+        with self.assertRaises(HTTPInputError) as cm:
+            parse_multipart_form_data(b"1234", body, args, files)
+        self.assertIn("header too large", str(cm.exception))
+        self.assertEqual(args, {})
+
+    def test_body_arguments_too_many_parts(self):
+        # The server-side entry point (HTTPServerRequest._parse_body) goes
+        # through parse_body_arguments, which logs and discards the body.
+        part = b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nb\r\n'
+        body = part * 1000 + b"--1234--"
+        args, files = form_data_args()
+        with ExpectLog(gen_log, ".*too many parts"):
+            parse_body_arguments(
+                "multipart/form-data; boundary=1234", body, args, files
+            )
+        self.assertEqual(args, {})
+        self.assertEqual(files, {})
+
+    def test_body_arguments_part_header_too_large(self):
+        header = b'Content-Disposition: form-data; name="a"\r\nX-Pad: '
+        header += b"x" * (64 * 1024)
+        body = b"--1234\r\n" + header + b"\r\n\r\nb\r\n--1234--"
+        args, files = form_data_args()
+        with ExpectLog(gen_log, ".*header too large"):
+            parse_body_arguments(
+                "multipart/form-data; boundary=1234", body, args, files
+            )
+        self.assertEqual(args, {})
+
+    def test_body_arguments_invalid_content_type(self):
+        part = b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nb\r\n'
+        body = part + b"--1234--"
+        args, files = form_data_args()
+        with ExpectLog(gen_log, ".*Invalid content type"):
+            parse_body_arguments(
+                "multipart/form-dataxyz; boundary=1234", body, args, files
+            )
+        self.assertEqual(args, {})
+
+    def test_body_arguments_config(self):
+        part = b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nb\r\n'
+        body = part * 3 + b"--1234--"
+        content_type = "multipart/form-data; boundary=1234"
+
+        # An explicit config raises or lowers the limits.
+        args, files = form_data_args()
+        config = ParseBodyConfig(multipart=ParseMultipartConfig(max_parts=2))
+        with ExpectLog(gen_log, ".*too many parts"):
+            parse_body_arguments(content_type, body, args, files, config=config)
+        self.assertEqual(args, {})
+
+        # The global default config can disable multipart parsing entirely.
+        set_parse_body_config(
+            ParseBodyConfig(multipart=ParseMultipartConfig(enabled=False))
+        )
+        try:
+            args, files = form_data_args()
+            with ExpectLog(gen_log, ".*multipart/form-data parsing is disabled"):
+                parse_body_arguments(content_type, body, args, files)
+            self.assertEqual(args, {})
+        finally:
+            set_parse_body_config(ParseBodyConfig())
+
+        # Defaults are restored.
+        args, files = form_data_args()
+        parse_body_arguments(content_type, body, args, files)
+        self.assertEqual(args["a"], [b"b", b"b", b"b"])
 
 
 class HTTPHeadersTest(unittest.TestCase):
